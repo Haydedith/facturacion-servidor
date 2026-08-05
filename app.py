@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -9,6 +10,7 @@ import os
 from datetime import datetime
 
 app = Flask(__name__)
+CORS(app)
 
 # Configuración de correo Outlook
 OUTLOOK_EMAIL = os.getenv('OUTLOOK_EMAIL', 'hparaguay@tandem.pe')
