@@ -130,6 +130,39 @@ def recibir_solicitud():
         return jsonify({'error': 'Error interno', 'detalle': str(e)}), 500
 
 
+@app.route('/config', methods=['GET'])
+def obtener_config():
+    """El portal llama aquí al iniciar, en vez de usar la lista fija en el HTML."""
+    try:
+        if not (SUPABASE_URL and SUPABASE_KEY):
+            return jsonify({'error': 'Base de datos no configurada'}), 500
+
+        def sb_get(tabla, select, order=None):
+            url = f'{SUPABASE_URL}/rest/v1/{tabla}?select={select}&limit=1000'
+            if order:
+                url += f'&order={order}'
+            r = requests.get(url, headers=supabase_headers(), timeout=15)
+            r.raise_for_status()
+            return r.json()
+
+        solicitantes = sb_get('solicitantes', 'nombre,activo,correo')
+        empresas     = sb_get('empresas', 'nombre,activo')
+        clientes     = sb_get('clientes_por_solicitante', 'solicitante,nombre_cliente,id_cliente,empresa')
+        reglas       = sb_get('reglas_documentos', 'id_cliente,nombre_cliente,plantilla,oc,hes,acta_conformidad,excel_liquidacion,aceptacion_servicio,cdr,adicionales,notas')
+
+        out = {
+            'solicitantes': [[r['nombre'], r['activo'], r['correo']] for r in solicitantes],
+            'empresas': [[r['nombre'], r['activo']] for r in empresas],
+            'clientes': [[r['solicitante'], r['nombre_cliente'], r['id_cliente'], r['empresa']] for r in clientes],
+            'reglas': [[r['id_cliente'], r['nombre_cliente'], r['plantilla'], r['oc'], r['hes'],
+                        r['acta_conformidad'], r['excel_liquidacion'], r['aceptacion_servicio'],
+                        r['cdr'], r['adicionales'], r['notas']] for r in reglas]
+        }
+        return jsonify(out), 200
+    except Exception as e:
+        return jsonify({'error': 'Error interno', 'detalle': str(e)}), 500
+
+
 @app.route('/solicitudes', methods=['GET'])
 def listar_solicitudes():
     """El Panel de Facturación llama aquí para ver TODAS las solicitudes."""
