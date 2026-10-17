@@ -56,8 +56,11 @@ CODIGO_MINUTOS = 10        # el código vence a los 10 minutos
 MAX_INTENTOS = 5           # intentos por código antes de invalidarlo
 MAX_CODIGOS_15MIN = 3      # códigos que se pueden pedir por correo en 15 minutos
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+# Valores de respaldo: se usan solo mientras en Supabase no existan la tabla tipos_documento ni la columna empresas.sociedad
 TIPOS_DOC = ('Factura', 'Nota de Crédito', 'Nota de Débito', 'Boleta')
 SOCIEDADES = ('Panorama Outsourcing', 'Sinercorp', 'Panorama Staff', 'Tándem')
+EMPRESA_SOCIEDAD_DEFECTO = {'P. Outsourcing': 'Panorama Outsourcing', 'P. Staff': 'Panorama Staff', 'Sinercorp': 'Sinercorp', 'Tándem': 'Tándem'}
+SKIP_VAL_DEFECTO = ('SD FMRETAIL', 'TIC')   # solicitantes que omiten la validación del nombre del cliente (si no existe la columna)
 
 ESTADOS_VALIDOS = ('Pendiente', 'Facturado', 'Enviado')
 SOL_ID_RE = re.compile(r'^SOL-[A-Z0-9]{4,20}$')
@@ -202,24 +205,31 @@ _cache_solicitantes = {'t': 0.0, 'datos': []}
 
 
 def solicitantes_activos():
-    """Lista de usuarios (se guarda 60 s en memoria para no consultar Supabase en cada petición)."""
+    """Lista de usuarios (se guarda 60 s en memoria para no consultar Supabase en cada petición).
+    Columnas opcionales de la tabla solicitantes: rol ('admin') y omitir_validacion_cliente ('Si'/'No')."""
     if time.time() - _cache_solicitantes['t'] < 60 and _cache_solicitantes['datos']:
         return _cache_solicitantes['datos']
-    r = requests.get(f'{SUPABASE_URL}/rest/v1/solicitantes', params={'select': 'nombre,activo,correo', 'limit': 1000},
-                     headers=sb_headers(), timeout=15)
-    r.raise_for_status()
-    datos = [{'nombre': x.get('nombre') or '', 'correo': (x.get('correo') or '').strip().lower(),
-              'activo': es_si(x.get('activo'))} for x in r.json()]
+    filas, usadas = consulta_con_opcionales('solicitantes', {'limit': 1000}, 'nombre,activo,correo',
+                                            [('rol',), ('omitir_validacion_cliente',)])
+    hay_omitir = 'omitir_validacion_cliente' in usadas
+    datos = []
+    for x in filas:
+        nombre = x.get('nombre') or ''
+        datos.append({'nombre': nombre, 'correo': (x.get('correo') or '').strip().lower(), 'activo': es_si(x.get('activo')),
+                      'rol': str(x.get('rol') or '').strip().lower(),
+                      'omitir': es_si(x.get('omitir_validacion_cliente')) if hay_omitir else nombre in SKIP_VAL_DEFECTO})
     _cache_solicitantes.update({'t': time.time(), 'datos': datos})
     return datos
 
 
 def buscar_usuario(correo):
-    """Usuario activo con ese correo (sin distinguir mayúsculas) o None."""
+    """Usuario activo con ese correo (sin distinguir mayúsculas) o None. Es administradora si su correo está en
+    ADMIN_EMAILS (Render) o si su rol en la tabla solicitantes es 'admin'."""
     correo = (correo or '').strip().lower()
     for u in solicitantes_activos():
         if u['activo'] and u['correo'] == correo:
-            return {'nombre': u['nombre'], 'correo': u['correo'], 'admin': correo in ADMIN_EMAILS}
+            return {'nombre': u['nombre'], 'correo': u['correo'], 'admin': correo in ADMIN_EMAILS or u['rol'] == 'admin',
+                    'omitir': bool(u['omitir'])}
     return None
 
 
@@ -381,7 +391,7 @@ def auth_verificar():
 
     token = _serializador().dumps({'c': usuario['correo']})
     return jsonify({'ok': True, 'token': token, 'horas': SESION_HORAS,
-                    'usuario': {'nombre': usuario['nombre'], 'correo': usuario['correo'], 'admin': usuario['admin']}}), 200
+                    'usuario': {'nombre': usuario['nombre'], 'correo': usuario['correo'], 'admin': usuario['admin'], 'omitir': usuario['omitir']}}), 200
 
 
 @app.route('/auth/yo', methods=['GET'])
@@ -395,22 +405,17 @@ def auth_yo():
 
 # ─── DATOS DEL CLIENTE, REGLAS Y AVISOS ──────────────────────────────────────
 def cliente_del_usuario(nombre, id_cliente):
-    """Fila del cliente asignado a esa persona (nombre, empresa y MAT) o None.
-    La columna del MAT puede llamarse mat o MAT; si aún no existe, el MAT queda vacío."""
-    url = f'{SUPABASE_URL}/rest/v1/clientes_por_solicitante'
-    base = {'solicitante': f'eq.{nombre}', 'id_cliente': f'eq.{id_cliente}', 'limit': 1}
-    for columna in ('mat', 'MAT', None):
-        r = requests.get(url, params={**base, 'select': 'nombre_cliente,empresa' + (f',{columna}' if columna else '')},
-                         headers=sb_headers(), timeout=15)
-        if r.status_code == 400 and columna is not None:
-            continue  # esa columna no existe: se prueba con la siguiente
-        r.raise_for_status()
-        filas = r.json()
-        if not filas:
-            return None
-        fila = filas[0]
-        fila['mat'] = texto_mat(fila.get('mat', fila.get('MAT')))
-        return fila
+    """Fila del cliente asignado a esa persona (nombre, empresa, MAT y si está activo) o None.
+    El MAT puede estar en una columna mat o MAT; si no existe, queda vacío. Si no hay columna activo, todos están activos."""
+    filas, usadas = consulta_con_opcionales('clientes_por_solicitante',
+                                            {'solicitante': f'eq.{nombre}', 'id_cliente': f'eq.{id_cliente}', 'limit': 1},
+                                            'nombre_cliente,empresa', [('mat', 'MAT'), ('activo',)])
+    if not filas:
+        return None
+    fila = filas[0]
+    fila['mat'] = texto_mat(fila.get('mat', fila.get('MAT')))
+    fila['activo'] = esta_activo(fila.get('activo')) if 'activo' in usadas else True
+    return fila
 
 
 def regla_cliente(id_cliente):
@@ -489,6 +494,81 @@ def aviso_cliente_incompleto():
     if faltantes:
         avisar_cliente_incompleto(id_cliente, limpiar(fila.get('nombre_cliente'), 200), g.usuario['nombre'], faltantes)
     return jsonify({'ok': True, 'avisado': bool(faltantes), 'faltan': faltantes}), 200
+
+
+# ─── LECTURA FLEXIBLE DE SUPABASE Y CONFIGURACIÓN QUE SE ADMINISTRA DESDE LAS TABLAS ──────────────
+_columnas_ok = {}
+
+
+def esta_activo(valor):
+    """Una columna 'activo' vacía cuenta como activa; solo 'No' (u otro valor negativo) desactiva."""
+    if valor is None or str(valor).strip() == '':
+        return True
+    return es_si(valor)
+
+
+def consulta_con_opcionales(tabla, params, base, grupos, tolerar_404=False):
+    """Lee una tabla pidiendo las columnas base y, si existen, las opcionales. Cada grupo son nombres alternativos de
+    una misma columna (por ejemplo mat o MAT). Devuelve (filas, columnas_opcionales_usadas). Recuerda 5 minutos cuál
+    combinación funcionó; después vuelve a probar, para notar columnas nuevas que agregues en Supabase."""
+    from itertools import product
+    url = f'{SUPABASE_URL}/rest/v1/{tabla}'
+    clave = (tabla, base, tuple(tuple(g) for g in grupos))
+    combos = list(product(*[tuple(g) + (None,) for g in grupos]))
+    previo = _columnas_ok.get(clave)
+    if previo and time.time() - previo[1] < 300 and previo[0] in combos:
+        combos = [previo[0]]
+    ultimo = None
+    for combo in combos:
+        columnas = base + ''.join(f',{c}' for c in combo if c)
+        r = requests.get(url, params={**params, 'select': columnas}, headers=sb_headers(), timeout=15)
+        if r.status_code == 404 and tolerar_404:
+            return None, ()
+        if r.status_code == 400:
+            ultimo = r
+            continue
+        r.raise_for_status()
+        _columnas_ok[clave] = (combo, time.time())
+        return r.json(), tuple(c for c in combo if c)
+    if previo:  # la combinación recordada dejó de funcionar: se vuelve a probar todo desde cero
+        _columnas_ok.pop(clave, None)
+        return consulta_con_opcionales(tabla, params, base, grupos, tolerar_404)
+    ultimo.raise_for_status()
+
+
+_cache_dinamica = {'t': 0.0, 'datos': None}
+
+
+def config_dinamica():
+    """Sociedades, relación empresa→sociedad y tipos de documento. Salen de Supabase (empresas.sociedad y la tabla
+    tipos_documento); si todavía no existen se usan los valores de respaldo. Se guardan 60 s en memoria."""
+    if _cache_dinamica['datos'] and time.time() - _cache_dinamica['t'] < 60:
+        return _cache_dinamica['datos']
+    mapa, sociedades, tipos = dict(EMPRESA_SOCIEDAD_DEFECTO), list(SOCIEDADES), list(TIPOS_DOC)
+    try:
+        filas, usadas = consulta_con_opcionales('empresas', {'limit': 200}, 'nombre,activo', [('sociedad',)])
+        if 'sociedad' in usadas:
+            mapa = {}
+            for f in filas:
+                nombre, soc = str(f.get('nombre') or '').strip(), str(f.get('sociedad') or '').strip()
+                if nombre and soc and esta_activo(f.get('activo')):
+                    mapa[nombre] = soc
+            sociedades = list(dict.fromkeys(mapa.values()))
+    except Exception as ex:
+        log.error('Configuración: no se pudo leer empresas (se usan los valores de respaldo): %s', ex)
+    try:
+        filas, usadas = consulta_con_opcionales('tipos_documento', {'limit': 200}, 'nombre,activo', [('orden',)], tolerar_404=True)
+        if filas is not None:
+            activos = [f for f in filas if str(f.get('nombre') or '').strip() and esta_activo(f.get('activo'))]
+            if 'orden' in usadas:
+                activos.sort(key=lambda f: (f.get('orden') is None, f.get('orden') or 0))
+            if activos:
+                tipos = [str(f['nombre']).strip() for f in activos]
+    except Exception as ex:
+        log.error('Configuración: no se pudo leer tipos_documento (se usan los valores de respaldo): %s', ex)
+    datos = {'mapa': mapa, 'sociedades': sociedades, 'tipos_doc': tipos}
+    _cache_dinamica.update({'t': time.time(), 'datos': datos})
+    return datos
 
 
 def preparar_adjuntos(archivos):
@@ -599,7 +679,8 @@ def recibir_solicitud():
     # Con sesión iniciada, la identidad, el cliente y el MAT salen de la base de datos, no del navegador.
     mat = ''
     if g.usuario is not None:
-        if tipo_doc not in TIPOS_DOC or sociedad not in SOCIEDADES:
+        cfg = config_dinamica()
+        if tipo_doc not in cfg['tipos_doc'] or sociedad not in cfg['sociedades']:
             return error('Tipo de documento o sociedad no válidos.', 400)
         try:
             fila_cli = cliente_del_usuario(g.usuario['nombre'], id_cliente)
@@ -609,6 +690,8 @@ def recibir_solicitud():
             return error('No se pudo validar el cliente. Intenta de nuevo en un minuto.', 502)
         if not fila_cli:
             return error('Ese cliente no está asignado a tu usuario.', 403)
+        if not fila_cli.get('activo', True):
+            return error('Este cliente está desactivado. Avisa a la administradora.', 403)
         solicitante = limpiar(g.usuario['nombre'], 120)
         correo_sol = limpiar(g.usuario['correo'], 120)
         cliente = limpiar(fila_cli.get('nombre_cliente'), 200)
@@ -736,13 +819,11 @@ def obtener_config():
     try:
         solicitantes = sb_get('solicitantes', 'nombre,activo,correo')
         empresas = sb_get('empresas', 'nombre,activo')
-        clientes = None
-        for columna in ('mat', 'MAT'):   # la columna puede llamarse mat o MAT
-            clientes = sb_get('clientes_por_solicitante', f'solicitante,nombre_cliente,id_cliente,empresa,{columna}', tolerar_400=True)
-            if clientes is not None:
-                break
-        if clientes is None:  # la columna del MAT aún no existe
-            clientes = sb_get('clientes_por_solicitante', 'solicitante,nombre_cliente,id_cliente,empresa')
+        clientes, usadas_cli = consulta_con_opcionales('clientes_por_solicitante', {'limit': 1000},
+                                                       'solicitante,nombre_cliente,id_cliente,empresa', [('mat', 'MAT'), ('activo',)])
+        if 'activo' in usadas_cli:   # los clientes desactivados no se ofrecen en el portal
+            clientes = [c for c in clientes if esta_activo(c.get('activo'))]
+        cfg = config_dinamica()
         reglas = sb_get('reglas_documentos', 'id_cliente,nombre_cliente,plantilla,oc,hes,acta_conformidad,'
                                               'excel_liquidacion,aceptacion_servicio,cdr,adicionales,notas')
     except Exception as ex:
@@ -759,6 +840,9 @@ def obtener_config():
     return jsonify({
         'solicitantes': [[r['nombre'], r['activo'], r['correo']] for r in solicitantes],
         'empresas': [[r['nombre'], r['activo']] for r in empresas],
+        'sociedades': cfg['sociedades'],
+        'empresa_sociedad': cfg['mapa'],
+        'tipos_documento': cfg['tipos_doc'],
         'clientes': [[r['solicitante'], r['nombre_cliente'], r['id_cliente'], r['empresa'], texto_mat(r.get('mat', r.get('MAT'))) or None] for r in clientes],
         'reglas': [[r['id_cliente'], r['nombre_cliente'], r['plantilla'], r['oc'], r['hes'],
                     r['acta_conformidad'], r['excel_liquidacion'], r['aceptacion_servicio'],
